@@ -1,12 +1,16 @@
 extern crate core;
 
+use crate::args::Args;
 use crate::blob::storage::Container;
 use async_std::channel::{unbounded, Sender};
 use async_std::task;
+use clap::Parser;
 use std::fs::File;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tide::{Request, StatusCode};
 
+mod args;
 mod blob;
 
 const TYPE_COUNT: u32 = 10;
@@ -15,11 +19,14 @@ const OBJECTS_IN_CONTAINER: u32 = 1_000;
 
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
+    let args = Args::parse();
     let mut senders = Vec::new();
 
     for type_id in 1..TYPE_COUNT {
         let (sender, receiver) = unbounded();
+        let root = args.root.clone();
         task::spawn(async move {
+            let root = Path::new(root.as_str());
             let mut object_count = 0u64;
             loop {
                 let mut container = Container::new(type_id);
@@ -28,7 +35,10 @@ async fn main() -> std::io::Result<()> {
                     container.push(WRITER_ID, obj.as_slice());
                     object_count += 1;
                 }
-                let file = File::create(format!("type{}_{}.blob", type_id, object_count)).unwrap();
+                let file = File::create(
+                    root.with_file_name(format!("type{}_{}.blob", type_id, object_count)),
+                )
+                .unwrap();
                 container.save_to_file(file).unwrap();
             }
         });
@@ -38,7 +48,7 @@ async fn main() -> std::io::Result<()> {
     let senders = Arc::new(RwLock::new(senders));
     let mut http_server = tide::with_state(senders);
     http_server.at("/type_id/:type_id").post(push);
-    http_server.listen("127.0.0.1:8080").await?;
+    http_server.listen(args.listen).await?;
     Ok(())
 }
 
@@ -51,7 +61,13 @@ async fn push(mut req: Request<Arc<RwLock<Vec<Sender<Vec<u8>>>>>>) -> tide::Resu
         ));
     }
     let body = req.body_bytes().await?;
-    let sender = req.state().read().unwrap().get(type_id as usize).unwrap().clone();
+    let sender = req
+        .state()
+        .read()
+        .unwrap()
+        .get(type_id as usize)
+        .unwrap()
+        .clone();
     sender.send(body).await?;
     Ok(format!("OK").into())
 }
