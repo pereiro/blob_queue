@@ -18,7 +18,7 @@ const OBJECTS_IN_CONTAINER: u32 = 1_000;
 
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
-    let args = Args::parse();
+    let args: Args = Args::parse();
     let mut senders = Vec::new();
     let mut receivers = Vec::new();
     for _ in 1..TYPE_COUNT{
@@ -26,12 +26,11 @@ async fn main() -> std::io::Result<()> {
         senders.push(sender);
         receivers.push(receiver);
     }
-
+    println!("root = {}",args.root);
     for type_id in 0..TYPE_COUNT-1 {
         let root = args.root.clone();
         let receivers = receivers.clone();
         task::spawn(async move {
-            let root = Path::new(root.as_str());
             let mut object_count = 0u64;
             let receiver = receivers.get(type_id as usize).unwrap();
             loop {
@@ -41,12 +40,9 @@ async fn main() -> std::io::Result<()> {
                     container.push(WRITER_ID, obj.as_slice());
                     object_count += 1;
                 }
-                let path = root.with_file_name(format!("type{}_{}.blob", type_id, object_count));
+                let path = Path::new(root.as_str()).with_file_name(format!("type{}_{}.blob", type_id, object_count));
                 println!("{}",path.to_str().unwrap());
-                let file = File::create(
-                    root.with_file_name(format!("type{}_{}.blob", type_id, object_count)),
-                )
-                .unwrap();
+                let file = File::create(path).unwrap();
                 container.save_to_file(file).unwrap();
             }
         });
