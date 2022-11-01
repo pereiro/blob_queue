@@ -4,12 +4,11 @@ use crate::args::Args;
 use crate::blob::storage::Container;
 use clap::Parser;
 use std::fs::File;
-use std::num::ParseIntError;
 use std::path::Path;
-use std::sync::{Arc, mpsc, RwLock};
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
-use futures_util::TryStreamExt;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task;
 
@@ -18,8 +17,23 @@ mod args;
 mod blob;
 
 const TYPE_COUNT: u32 = 10;
-const WRITER_ID: u32 = 1;
+const WRITER_COUNT: u32 = 10;
 const OBJECTS_IN_CONTAINER: u32 = 1_000;
+
+#[derive(Debug)]
+struct PostData{
+    data: Vec<u8>,
+    writer_id: u32,
+}
+
+impl PostData {
+    fn new(writer_id:u32, data:Vec<u8>)-> Self{
+        Self{
+            data,
+            writer_id
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -33,15 +47,17 @@ async fn main() -> std::io::Result<()> {
         senders.push(sender);
         let root = args.root.clone();
         task::spawn(async move {
-            let mut object_count = 0u64;
             loop {
+                let creation_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros();
                 let mut container = Container::new(type_id);
                 for _ in 0..OBJECTS_IN_CONTAINER {
-                    let obj: Vec<u8> = receiver.recv().await.unwrap();
-                    container.push(WRITER_ID, obj.as_slice());
-                    object_count += 1;
+                    let obj: PostData = receiver.recv().await.unwrap();
+                    container.push(obj.writer_id,obj.data.as_slice());
                 }
-                let path = Path::new(root.as_str()).with_file_name(format!("type{}_{}.blob", type_id, object_count));
+                let path = Path::new(root.as_str()).join(format!("type{}_{}.blob", type_id, creation_time));
                 println!("{}",path.to_str().unwrap());
                 let file = File::create(path).unwrap();
                 container.save_to_file(file).unwrap();
@@ -51,7 +67,7 @@ async fn main() -> std::io::Result<()> {
     let senders = Arc::new(RwLock::new(senders));
     let addr = ([0, 0, 0, 0], 8080).into();
     let service = make_service_fn(move |_| {
-        let mut senders = senders.clone();
+        let senders = senders.clone();
         async move {
             Ok::<_, hyper::Error>(service_fn(move |_req|{
                 let senders = senders.clone();
@@ -71,8 +87,8 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn handler(req: Request<Body>,senders:Arc<RwLock<Vec<UnboundedSender<Vec<u8>>>>>) -> Result<Response<Body>, hyper::Error> {
-    let type_id = match  parse_type_id(req.uri().path()) {
+async fn handler(req: Request<Body>,senders:Arc<RwLock<Vec<UnboundedSender<PostData>>>>) -> Result<Response<Body>, hyper::Error> {
+    let (type_id,writer_id) = match  parse_path(req.uri().path()) {
         None => {
             let mut bad_request = Response::default();
             *bad_request.status_mut() = StatusCode::BAD_REQUEST;
@@ -80,18 +96,18 @@ async fn handler(req: Request<Body>,senders:Arc<RwLock<Vec<UnboundedSender<Vec<u
         }
         Some(type_id ) => { type_id}
     };
-    if type_id >= TYPE_COUNT {
+    if type_id >= TYPE_COUNT || writer_id >= WRITER_COUNT{
         let mut bad_request = Response::default();
         *bad_request.status_mut() = StatusCode::BAD_REQUEST;
         return Ok(bad_request)
     }
     match req.method() {
-        (&Method::POST) => {
+        &Method::POST => {
             let whole_body = hyper::body::to_bytes(req.into_body()).await?.to_vec();
             let senders = senders.read().unwrap();
             let sender = senders.get(type_id as usize ).unwrap();
-            sender.send(whole_body).unwrap();
-            Ok(Response::new(Body::from(format!("OK,type_id={}",type_id))))
+            sender.send(PostData::new(writer_id,whole_body)).unwrap();
+            Ok(Response::new(Body::from(format!("OK"))))
         }
         _ => {
             let mut not_found = Response::default();
@@ -101,13 +117,18 @@ async fn handler(req: Request<Body>,senders:Arc<RwLock<Vec<UnboundedSender<Vec<u
     }
 }
 
-fn parse_type_id(path: &str) -> Option<u32>{
+fn parse_path(path: &str) -> Option<(u32,u32)>{
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len()<3 || parts[1].to_lowercase() != "type_id"{
+    if parts.len()<5 || parts[1].to_lowercase() != "type_id" || parts[3].to_lowercase() != "writer_id" {
         return None;
     }
-    match parts[2].parse::<u32>(){
-        Ok(type_id) => { Some(type_id)}
-        Err(_) => { None }
-    }
+    let type_id = match parts[2].parse::<u32>(){
+        Ok(type_id) => { type_id}
+        Err(_) => { return None }
+    };
+    let writer_id = match parts[4].parse::<u32>() {
+        Ok(writer_id) => { writer_id}
+        Err(_) => { return None }
+    };
+    Some((type_id,writer_id))
 }
