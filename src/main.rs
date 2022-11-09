@@ -1,31 +1,29 @@
 extern crate core;
 
-use crate::args::Args;
 use crate::blob::storage::Container;
+use crate::config::{Args, Config};
+use crate::metrics::Success::{No, Yes};
+use crate::metrics::{HttpLabels, HttpMethod, HttpStatus};
 use clap::Parser;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
-use std::fs::File;
-use std::path::Path;
-use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task;
-use crate::metrics::{HttpLabels, HttpMethod, HttpStatus};
-use crate::metrics::Success::{No, Yes};
 
-mod args;
 mod blob;
+mod config;
 mod metrics;
 
-
-const TYPE_COUNT: u32 = 10;
 const WRITER_COUNT: u32 = 10;
-const OBJECTS_IN_CONTAINER: u32 = 1_000;
 
 #[derive(Debug)]
 struct PostData {
@@ -41,24 +39,24 @@ impl PostData {
 
 #[derive(Clone)]
 struct Context {
-    senders: Arc<RwLock<Vec<UnboundedSender<PostData>>>>,
-    http_requests_metrics: Family<HttpLabels,Counter>,
+    senders: Arc<RwLock<HashMap<u32, UnboundedSender<PostData>>>>,
+    http_requests_metrics: Family<HttpLabels, Counter>,
     http_requests_registry: Arc<Registry>,
 }
 
 impl Context {
-    pub fn new(senders: Vec<UnboundedSender<PostData>>) -> Self{
+    pub fn new(senders: HashMap<u32, UnboundedSender<PostData>>) -> Self {
         let mut http_requests_registry = <Registry>::default();
-        let http_requests_metrics = Family::<HttpLabels,Counter>::default();
+        let http_requests_metrics = Family::<HttpLabels, Counter>::default();
         http_requests_registry.register(
             "http_requests",
             "Number of HTTP requests received",
             Box::new(http_requests_metrics.clone()),
         );
-        Self{
+        Self {
             senders: Arc::new(RwLock::new(senders)),
             http_requests_metrics,
-            http_requests_registry: Arc::new(http_requests_registry)
+            http_requests_registry: Arc::new(http_requests_registry),
         }
     }
 }
@@ -66,27 +64,26 @@ impl Context {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Args = Args::parse();
-    let mut senders = Vec::new();
+    let config = Config::from_file(args.config)?;
+    let mut senders = HashMap::new();
 
-    println!("root = {}", args.root);
-
-    for type_id in 0..TYPE_COUNT - 1 {
+    for type_id in config.types {
         let (sender, mut receiver) = unbounded_channel();
-        senders.push(sender);
-        let root = args.root.clone();
+        let type_id = type_id.clone();
+        senders.insert(type_id.type_id, sender);
         task::spawn(async move {
             loop {
                 let creation_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_micros();
-                let mut container = Container::new(type_id);
-                for _ in 0..OBJECTS_IN_CONTAINER {
+                let mut container = Container::new(type_id.type_id);
+                for _ in 0..type_id.objects_in_container {
                     let obj: PostData = receiver.recv().await.unwrap();
                     container.push(obj.writer_id, obj.data.as_slice());
                 }
-                let path = Path::new(root.as_str())
-                    .join(format!("type{}_{}.blob", type_id, creation_time));
+                let path = Path::new(type_id.root.as_str())
+                    .join(format!("type{}_{}.blob", type_id.type_id, creation_time));
                 println!("{}", path.to_str().unwrap());
                 let file = File::create(path).unwrap();
                 container.save_to_file(file).unwrap();
@@ -94,7 +91,7 @@ async fn main() -> std::io::Result<()> {
         });
     }
     let ctx = Context::new(senders);
-    let addr = ([0, 0, 0, 0], args.port).into();
+    let addr = ([0, 0, 0, 0], config.server.port).into();
     let service = make_service_fn(move |_| {
         let ctx = ctx.clone();
         async move {
@@ -116,39 +113,62 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn handler(
-    req: Request<Body>,
-    ctx: Context,
-) -> Result<Response<Body>, hyper::Error> {
-
+async fn handler(req: Request<Body>, ctx: Context) -> Result<Response<Body>, hyper::Error> {
     match req.method() {
         &Method::POST => {
             let (type_id, writer_id) = match parse_path(req.uri().path()) {
                 None => {
                     ctx.http_requests_metrics
-                        .get_or_create(&HttpLabels{method:HttpMethod::POST, status: HttpStatus::Status2xx,success: No,type_id: 0, writer_id:0})
+                        .get_or_create(&HttpLabels {
+                            method: HttpMethod::POST,
+                            status: HttpStatus::Status2xx,
+                            success: No,
+                            type_id: 0,
+                            writer_id: 0,
+                        })
                         .inc();
                     return Ok(Response::new(Body::from(
                         r#"{ "state": -1,"reason"=41,desc="invalid path, need /type_id/N/writer_id/K" }"#
                             .to_string(),
-                    )))
+                    )));
                 }
                 Some(type_id) => type_id,
             };
-            if type_id >= TYPE_COUNT || writer_id >= WRITER_COUNT {
+
+            if writer_id >= WRITER_COUNT {
                 ctx.http_requests_metrics
-                    .get_or_create(&HttpLabels{method:HttpMethod::POST, status: HttpStatus::Status2xx,success: No,type_id: 0, writer_id:0})
+                    .get_or_create(&HttpLabels {
+                        method: HttpMethod::POST,
+                        status: HttpStatus::Status2xx,
+                        success: No,
+                        type_id: 0,
+                        writer_id: 0,
+                    })
                     .inc();
                 return Ok(Response::new(Body::from(
-                    r#"{ "state": -1,"reason"=42,desc="invalid type_id or writer_id value" }"#.to_string(),
+                    r#"{ "state": -1,"reason"=42,desc="invalid  writer_id value" }"#.to_string(),
                 )));
             }
             let whole_body = hyper::body::to_bytes(req.into_body()).await?.to_vec();
             let senders = ctx.senders.read().unwrap();
-            let sender = senders.get(type_id as usize).unwrap();
+            let sender = match senders.get(&type_id) {
+                None => {
+                    return Ok(Response::new(Body::from(
+                        r#"{ "state": -1,"reason"=43,desc="invalid type_id value" }"#.to_string(),
+                    )));
+                }
+                Some(s) => s.clone(),
+            };
+
             sender.send(PostData::new(writer_id, whole_body)).unwrap();
             ctx.http_requests_metrics
-                .get_or_create(&HttpLabels{method:HttpMethod::POST, status: HttpStatus::Status2xx,success: Yes,type_id, writer_id})
+                .get_or_create(&HttpLabels {
+                    method: HttpMethod::POST,
+                    status: HttpStatus::Status2xx,
+                    success: Yes,
+                    type_id,
+                    writer_id,
+                })
                 .inc();
             Ok(Response::new(Body::from(r#"{ "state": 0 }"#.to_string())))
         }
@@ -156,11 +176,16 @@ async fn handler(
             let mut buffer = vec![];
             encode(&mut buffer, &ctx.http_requests_registry).unwrap();
             Ok(Response::new(Body::from(buffer)))
-
         }
         _ => {
             ctx.http_requests_metrics
-                .get_or_create(&HttpLabels{method:HttpMethod::GET, status: HttpStatus::Status4xx,success: No,type_id: 0, writer_id:0})
+                .get_or_create(&HttpLabels {
+                    method: HttpMethod::GET,
+                    status: HttpStatus::Status4xx,
+                    success: No,
+                    type_id: 0,
+                    writer_id: 0,
+                })
                 .inc();
             let mut not_found = Response::default();
             *not_found.status_mut() = StatusCode::METHOD_NOT_ALLOWED;

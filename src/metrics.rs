@@ -5,8 +5,8 @@ pub struct HttpLabels {
     pub method: HttpMethod,
     pub status: HttpStatus,
     pub success: Success,
-    pub type_id:u32,
-    pub writer_id: u32
+    pub type_id: u32,
+    pub writer_id: u32,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Encode)]
@@ -20,7 +20,7 @@ pub enum HttpStatus {
     Status2xx,
     Status3xx,
     Status4xx,
-    Status5xx
+    Status5xx,
 }
 #[derive(Clone, Hash, PartialEq, Eq, Encode)]
 pub enum Success {

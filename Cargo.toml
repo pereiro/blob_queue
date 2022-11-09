@@ -12,3 +12,6 @@ clap = { version = "4.0.18", features = ["derive"] }
 hyper = { version = "0.14", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
 prometheus-client = "0.18.1"
+toml = "0.5.9"
+serde = "1.0.147"
+serde_derive = "1.0.147"
