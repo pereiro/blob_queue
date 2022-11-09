@@ -153,6 +153,15 @@ async fn handler(req: Request<Body>, ctx: Context) -> Result<Response<Body>, hyp
             let senders = ctx.senders.read().unwrap();
             let sender = match senders.get(&type_id) {
                 None => {
+                    ctx.http_requests_metrics
+                        .get_or_create(&HttpLabels {
+                            method: HttpMethod::POST,
+                            status: HttpStatus::Status2xx,
+                            success: No,
+                            type_id: 0,
+                            writer_id,
+                        })
+                        .inc();
                     return Ok(Response::new(Body::from(
                         r#"{ "state": -1,"reason"=43,desc="invalid type_id value" }"#.to_string(),
                     )));
